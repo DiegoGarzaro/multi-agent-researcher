@@ -22,6 +22,7 @@ from agno.tools.trafilatura import TrafilaturaTools
 from ai_prompts import (
     RESEARCH_INSTRUCTIONS,
     WRITER_INSTRUCTIONS,
+    TRANSLATOR_INSTRUCTIONS,
     EDITOR_INSTRUCTIONS
 )
 
@@ -35,6 +36,7 @@ AGENTS_LOG_DIR.mkdir(exist_ok=True)
 # Load OpenAI model configurations from environment variables
 RESEARCHER_MODEL = os.getenv("RESEARCHER_MODEL", "gpt-4o-mini")
 WRITER_MODEL = os.getenv("WRITER_MODEL", "gpt-4o-mini")
+TRANSLATOR_MODEL = os.getenv("TRANSLATOR_MODEL", "gpt-4o-mini")
 EDITOR_MODEL = os.getenv("EDITOR_MODEL", "gpt-4o-mini")
 
 
@@ -107,7 +109,7 @@ def build_writer() -> Agent:
     """Build and configure the Writer agent.
 
     The Writer agent transforms research briefs into compelling,
-    persuasive articles in Portuguese (PT-BR) using marketing techniques.
+    persuasive articles using marketing techniques.
 
     The model used is configured via the WRITER_MODEL environment variable.
     Default: gpt-4o-mini
@@ -120,9 +122,34 @@ def build_writer() -> Agent:
     """
     return Agent(
         name="Writer",
-        role="Organize research, draft the article and translator",
+        role="Draft compelling, persuasive articles",
         model=OpenAIChat(id=WRITER_MODEL),
         instructions=WRITER_INSTRUCTIONS,
+        markdown=True,
+    )
+
+
+def build_translator() -> Agent:
+    """Build and configure the Translator agent.
+
+    The Translator agent translates content from English to Portuguese (PT-BR)
+    with natural, culturally-adapted language that maintains the original's
+    persuasive tone.
+
+    The model used is configured via the TRANSLATOR_MODEL environment variable.
+    Default: gpt-4o-mini
+
+    Args:
+        None
+
+    Returns:
+        Agent: Configured Translator agent specialized in EN to PT-BR translation.
+    """
+    return Agent(
+        name="Translator",
+        role="Translate content from English to Portuguese (PT-BR)",
+        model=OpenAIChat(id=TRANSLATOR_MODEL),
+        instructions=TRANSLATOR_INSTRUCTIONS,
         markdown=True,
     )
 
@@ -131,7 +158,8 @@ def build_editor() -> Agent:
     """Build and configure the Editor agent.
 
     The Editor agent reviews articles for accuracy, quality, marketing
-    effectiveness, and PT-BR language compliance.
+    effectiveness, and PT-BR language compliance. It also routes work to
+    the appropriate specialist agent (Researcher, Writer, or Translator).
 
     The model used is configured via the EDITOR_MODEL environment variable.
     Default: gpt-4o-mini
@@ -140,11 +168,11 @@ def build_editor() -> Agent:
         None
 
     Returns:
-        Agent: Configured Editor agent for quality control and fact-checking.
+        Agent: Configured Editor agent for quality control and workflow routing.
     """
     return Agent(
         name="Editor",
-        role="Critically review and request revisions",
+        role="Review quality and route work to appropriate agents",
         model=OpenAIChat(id=EDITOR_MODEL),
         instructions=EDITOR_INSTRUCTIONS,
         markdown=True,
@@ -153,23 +181,24 @@ def build_editor() -> Agent:
 
 # Workflow (orchestrator)
 def assemble_team() -> Team:
-    """Assemble a multi-agent team for research and writing tasks.
+    """Assemble a multi-agent team for research, writing, and translation tasks.
 
-    Creates a team with Researcher, Writer, and Editor agents.
-    The Editor acts as the team leader and can coordinate with other members.
+    Creates a team with Researcher, Writer, Translator, and Editor agents.
+    The Editor acts as the workflow coordinator and routes work appropriately.
 
     Args:
         None
 
     Returns:
-        Team: Configured team with all three agents (Researcher, Writer, Editor).
+        Team: Configured team with all four agents (Researcher, Writer, Translator, Editor).
     """
     researcher = build_researcher()
     writer = build_writer()
+    translator = build_translator()
     editor = build_editor()
     return Team(
-        name="Research & Writing Team",
-        members=[researcher, writer, editor],
+        name="Research, Writing & Translation Team",
+        members=[researcher, writer, translator, editor],
         # By default, the team leader coordinates; we'll still drive via Workflow.
         markdown=True,
     )
@@ -223,8 +252,8 @@ def write_step_fn(step_input: StepInput, topic: str = "", round_number: int = 0)
     writer = build_writer()
 
     prompt = (
-        f"Escreva um artigo sobre: {topic}\n\n"
-        f"Aqui está o relatório de pesquisa (use-o estritamente, mantenha a numeração das fontes):\n\n{brief}"
+        f"Write an article about: {topic}\n\n"
+        f"Here is the research brief (use it strictly, maintain source numbering):\n\n{brief}"
     )
 
     result = writer.run(prompt)
@@ -242,6 +271,40 @@ def write_step_fn(step_input: StepInput, topic: str = "", round_number: int = 0)
     )
 
     return StepOutput(content=draft_content)
+
+def translator_step_fn(step_input: StepInput, round_number: int = 0) -> StepOutput:
+    """Run the Translator to translate content to Portuguese (PT-BR).
+
+    Args:
+        step_input: The input containing the content to translate.
+        round_number: The revision round number (0 for initial execution).
+
+    Returns:
+        StepOutput: The translated content in PT-BR.
+    """
+    content = step_input.previous_step_outputs or step_input.input
+    translator = build_translator()
+
+    prompt = (
+        "Translate the following content to Portuguese (PT-BR):\n\n"
+        f"{content}"
+    )
+
+    result = translator.run(prompt)
+
+    # Extract only the content from RunOutput object
+    translated_content = result.content if hasattr(result, 'content') else str(result)
+
+    # Log the execution
+    log_agent_execution(
+        agent_name="Translator",
+        input_data=prompt,
+        output_data=translated_content,
+        round_number=round_number,
+        step="translate"
+    )
+
+    return StepOutput(content=translated_content)
 
 def edit_step_fn(step_input: StepInput, round_number: int = 0) -> StepOutput:
     """Run the Editor to approve or request revisions.
@@ -285,82 +348,129 @@ def revision_loop(
 
     The function orchestrates the multi-agent workflow:
     1. Researcher conducts web research and creates a brief
-    2. Writer creates an article from the research brief
-    3. Editor reviews and either approves or requests revisions
-    4. If revisions requested, loop back to step 1 with editor feedback
+    2. Writer creates an article from the research brief (in English)
+    3. Translator translates the article to Portuguese (PT-BR)
+    4. Editor reviews and either approves or routes to appropriate agent
+    5. If routing requested, execute the specific agent and continue loop
 
     Args:
         topic: The research topic to investigate and write about.
         max_rounds: Maximum number of revision rounds (default: 2).
 
     Returns:
-        str: The final article content in markdown format.
+        str: The final article content in markdown format (PT-BR).
     """
-    # 1) Initial research and write (round 0)
+    # 1) Initial research, write, and translate (round 0)
     research_out = research_step_fn(StepInput(input=topic), round_number=0).content
     draft_out = write_step_fn(StepInput(input=research_out), topic=topic, round_number=0).content
-    verdict = edit_step_fn(StepInput(input=draft_out), round_number=0).content
+    translated_out = translator_step_fn(StepInput(input=draft_out), round_number=0).content
+    verdict = edit_step_fn(StepInput(input=translated_out), round_number=0).content
 
     rounds = 0
-    while rounds < max_rounds and verdict.upper().startswith("REVISE"):
+    while rounds < max_rounds and not verdict.upper().startswith("APPROVE"):
         rounds += 1
-        # Extract the editor's numbered requests and feed back to Researcher
-        researcher = build_researcher()
 
-        revision_prompt = (
-            f"Tópico: {topic}\n"
-            "Você deve atender às solicitações de revisão do Editor abaixo, encontrando informações confiáveis que faltam.\n"
-            "Adicione novas fontes conforme necessário e atualize o relatório, preservando a numeração.\n\n"
-            f"Solicitações do Editor:\n{verdict}\n\n"
-            "Retorne o relatório de pesquisa ATUALIZADO."
-        )
+        # Parse the routing decision from the editor
+        if verdict.upper().startswith("ROUTE_TO_RESEARCHER"):
+            # Route to Researcher for additional research
+            researcher = build_researcher()
 
-        updated_result = researcher.run(revision_prompt)
-        updated_brief = updated_result.content if hasattr(updated_result, 'content') else str(updated_result)
+            revision_prompt = (
+                f"Topic: {topic}\n"
+                "You need to address the Editor's revision requests below by finding missing reliable information.\n"
+                "Add new sources as needed and update the brief, preserving source numbering.\n\n"
+                f"Editor's Requests:\n{verdict}\n\n"
+                "Return the UPDATED research brief."
+            )
 
-        # Log revision research
-        log_agent_execution(
-            agent_name="Researcher",
-            input_data=revision_prompt,
-            output_data=updated_brief,
-            round_number=rounds,
-            step="revision_research"
-        )
+            updated_result = researcher.run(revision_prompt)
+            research_out = updated_result.content if hasattr(updated_result, 'content') else str(updated_result)
 
-        # Rewrite with updated brief
-        writer = build_writer()
+            # Log revision research
+            log_agent_execution(
+                agent_name="Researcher",
+                input_data=revision_prompt,
+                output_data=research_out,
+                round_number=rounds,
+                step="revision_research"
+            )
 
-        rewrite_prompt = (
-            f"Reescreva o artigo sobre: {topic}\n"
-            "Use este relatório de pesquisa ATUALIZADO e mantenha as citações consistentes. "
-            "Se novas fontes foram adicionadas, estenda a numeração e inclua-as nas Fontes.\n\n"
-            f"{updated_brief}"
-        )
+            # Rewrite with updated brief
+            draft_out = write_step_fn(StepInput(input=research_out), topic=topic, round_number=rounds).content
 
-        draft_result = writer.run(rewrite_prompt)
-        draft_out = draft_result.content if hasattr(draft_result, 'content') else str(draft_result)
+            # Translate the updated draft
+            translated_out = translator_step_fn(StepInput(input=draft_out), round_number=rounds).content
 
-        # Log revision writing
-        log_agent_execution(
-            agent_name="Writer",
-            input_data=rewrite_prompt,
-            output_data=draft_out,
-            round_number=rounds,
-            step="revision_write"
-        )
+        elif verdict.upper().startswith("ROUTE_TO_WRITER"):
+            # Route to Writer for content improvements
+            writer = build_writer()
 
-        verdict = edit_step_fn(StepInput(input=draft_out), round_number=rounds).content
+            rewrite_prompt = (
+                f"Rewrite the article about: {topic}\n"
+                "Address the Editor's feedback below. Maintain citation consistency. "
+                "If new sources were added, extend the numbering and include them in Sources.\n\n"
+                f"Editor's Feedback:\n{verdict}\n\n"
+                f"Research Brief:\n{research_out}\n\n"
+                f"Previous Draft:\n{draft_out}"
+            )
 
-    # Return the best draft (even if Editor still wants tweaks after max rounds)
-    return draft_out
+            draft_result = writer.run(rewrite_prompt)
+            draft_out = draft_result.content if hasattr(draft_result, 'content') else str(draft_result)
+
+            # Log revision writing
+            log_agent_execution(
+                agent_name="Writer",
+                input_data=rewrite_prompt,
+                output_data=draft_out,
+                round_number=rounds,
+                step="revision_write"
+            )
+
+            # Translate the updated draft
+            translated_out = translator_step_fn(StepInput(input=draft_out), round_number=rounds).content
+
+        elif verdict.upper().startswith("ROUTE_TO_TRANSLATOR"):
+            # Route to Translator for translation improvements
+            translator = build_translator()
+
+            retranslate_prompt = (
+                "Retranslate the following content to Portuguese (PT-BR).\n"
+                "Address the Editor's feedback below:\n\n"
+                f"Editor's Feedback:\n{verdict}\n\n"
+                f"Original English Content:\n{draft_out}"
+            )
+
+            translate_result = translator.run(retranslate_prompt)
+            translated_out = translate_result.content if hasattr(translate_result, 'content') else str(translate_result)
+
+            # Log revision translation
+            log_agent_execution(
+                agent_name="Translator",
+                input_data=retranslate_prompt,
+                output_data=translated_out,
+                round_number=rounds,
+                step="revision_translate"
+            )
+
+        else:
+            # Unrecognized routing command, break to avoid infinite loop
+            print(f"Warning: Unrecognized editor response: {verdict[:100]}")
+            break
+
+        # Get editor's verdict on the updated content
+        verdict = edit_step_fn(StepInput(input=translated_out), round_number=rounds).content
+
+    # Return the final translated draft (even if Editor still wants tweaks after max rounds)
+    return translated_out
 
 def build_workflow() -> Workflow:
-    """Build a single-pass workflow for research, writing, and editing.
+    """Build a single-pass workflow for research, writing, translation, and editing.
 
-    This creates a workflow with three sequential steps:
+    This creates a workflow with four sequential steps:
     1. Research step - Conducts web research
-    2. Write step - Creates article from research
-    3. Edit step - Reviews and validates the article
+    2. Write step - Creates article from research (in English)
+    3. Translate step - Translates article to Portuguese (PT-BR)
+    4. Edit step - Reviews and validates the article
 
     Note: The main execution uses revision_loop instead for iterative improvement.
 
@@ -368,13 +478,14 @@ def build_workflow() -> Workflow:
         None
 
     Returns:
-        Workflow: Configured workflow with research, write, and edit steps.
+        Workflow: Configured workflow with research, write, translate, and edit steps.
     """
     return Workflow(
-        name="Research->Write->Edit",
+        name="Research->Write->Translate->Edit",
         steps=[
             research_step_fn,
             Step(executor=write_step_fn, name="Write"),
+            Step(executor=translator_step_fn, name="Translate"),
             Step(executor=edit_step_fn, name="Edit"),
         ],
     )

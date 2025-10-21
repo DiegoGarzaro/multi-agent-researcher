@@ -13,3 +13,8 @@ dependencies = [
     "fastapi>=0.119.0",
     "ddgs>=9.5.2",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8.4",
+]
